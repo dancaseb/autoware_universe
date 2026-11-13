@@ -27,8 +27,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -83,6 +90,63 @@ std_msgs::msg::Header createHeader(const rclcpp::Time & now)
   header.frame_id = "map";
   header.stamp = now;
   return header;
+}
+
+// ---- QP dump helpers: PETSc binary format (big-endian, 32-bit indices) ----
+// Readable with PETSc MatLoad/VecLoad (PERMON), PetscBinaryIO.py, or PetscBinaryRead.m.
+constexpr int32_t PETSC_VEC_FILE_CLASSID = 1211214;
+constexpr int32_t PETSC_MAT_FILE_CLASSID = 1211216;
+// Entries below this magnitude are dropped, exactly as autoware_osqp_interface does
+// (csc_matrix_conv.cpp), so the dumped P equals the matrix OSQP actually received.
+constexpr double OSQP_WRAPPER_DROP_TOL = 1e-9;
+
+template <typename T>
+void writeBigEndian(std::ofstream & ofs, const T value)
+{
+  static_assert(sizeof(T) == 4 || sizeof(T) == 8, "unsupported size");
+  unsigned char bytes[sizeof(T)];
+  std::memcpy(bytes, &value, sizeof(T));
+  const uint16_t one = 1;
+  if (*reinterpret_cast<const unsigned char *>(&one) == 1) {  // little-endian host
+    std::reverse(bytes, bytes + sizeof(T));
+  }
+  ofs.write(reinterpret_cast<const char *>(bytes), sizeof(T));
+}
+
+void writePetscVec(const std::string & path, const std::vector<double> & vec)
+{
+  std::ofstream ofs(path, std::ios::binary);
+  writeBigEndian<int32_t>(ofs, PETSC_VEC_FILE_CLASSID);
+  writeBigEndian<int32_t>(ofs, static_cast<int32_t>(vec.size()));
+  for (const double v : vec) {
+    writeBigEndian<double>(ofs, v);
+  }
+}
+
+// Writes the full (both triangles) matrix in CSR order; returns the number of non-zeros.
+size_t writePetscMat(const std::string & path, const Eigen::MatrixXd & mat)
+{
+  std::vector<int32_t> row_nnz(mat.rows(), 0);
+  std::vector<int32_t> col_idx;
+  std::vector<double> values;
+  for (Eigen::Index r = 0; r < mat.rows(); ++r) {
+    for (Eigen::Index c = 0; c < mat.cols(); ++c) {
+      if (std::fabs(mat(r, c)) >= OSQP_WRAPPER_DROP_TOL) {
+        ++row_nnz.at(r);
+        col_idx.push_back(static_cast<int32_t>(c));
+        values.push_back(mat(r, c));
+      }
+    }
+  }
+  std::ofstream ofs(path, std::ios::binary);
+  writeBigEndian<int32_t>(ofs, PETSC_MAT_FILE_CLASSID);
+  writeBigEndian<int32_t>(ofs, static_cast<int32_t>(mat.rows()));
+  writeBigEndian<int32_t>(ofs, static_cast<int32_t>(mat.cols()));
+  writeBigEndian<int32_t>(ofs, static_cast<int32_t>(values.size()));
+  for (const auto n : row_nnz) writeBigEndian<int32_t>(ofs, n);
+  for (const auto c : col_idx) writeBigEndian<int32_t>(ofs, c);
+  for (const auto v : values) writeBigEndian<double>(ofs, v);
+  return values.size();
 }
 }  // namespace
 
@@ -193,6 +257,7 @@ EBPathSmoother::EBPathSmoother(
 {
   eb_param_ = EBParam(node);
   setUpPublishers(node);
+  initQPDump();
 }
 
 EBPathSmoother::EBPathSmoother(
@@ -208,6 +273,74 @@ EBPathSmoother::EBPathSmoother(
 {
   eb_param_ = EBParam(node);
   setUpPublishers(node);
+  initQPDump();
+}
+
+void EBPathSmoother::initQPDump()
+{
+  const char * dir = std::getenv("EB_QP_DUMP_DIR");
+  if (dir == nullptr || std::string(dir).empty()) {
+    return;
+  }
+  QPDump dump;
+  dump.dir = dir;
+  if (const char * max_str = std::getenv("EB_QP_DUMP_MAX")) {
+    dump.max_count = std::strtoul(max_str, nullptr, 10);
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(dump.dir, ec);
+  if (ec) {
+    RCLCPP_ERROR(logger_, "QP dump disabled: cannot create %s (%s)", dir, ec.message().c_str());
+    return;
+  }
+  const std::string index_path = dump.dir + "/index.csv";
+  if (!std::filesystem::exists(index_path)) {
+    std::ofstream(index_path)
+      << "id,stamp_ns,n,nnz_P,warm_start_update,assemble_ms,osqp_update_ms,solve_ms,"
+         "osqp_run_time_ms,iterations,status,obj_val\n";
+  }
+  RCLCPP_WARN(
+    logger_, "Dumping elastic band QPs to %s (max %zu problems)", dir, dump.max_count);
+  qp_dump_ = dump;
+}
+
+void EBPathSmoother::dumpQP(
+  const std::vector<double> & solution, const double solve_ms, const int status,
+  const int64_t iterations, const double osqp_run_time_s, const double obj_val)
+{
+  auto & d = *qp_dump_;
+  if (d.count >= d.max_count) {
+    return;
+  }
+  char prefix_buf[32];
+  std::snprintf(prefix_buf, sizeof(prefix_buf), "/eb_%06zu", d.count);
+  const std::string prefix = d.dir + prefix_buf;
+
+  const size_t nnz = writePetscMat(prefix + "_P.bin", d.P);
+  writePetscVec(prefix + "_q.bin", d.q);
+  writePetscVec(prefix + "_l.bin", d.l);
+  writePetscVec(prefix + "_u.bin", d.u);
+  writePetscVec(prefix + "_x_osqp.bin", solution);
+  {
+    std::ofstream ref(prefix + "_ref.csv");
+    ref.precision(17);
+    ref << "i,x,y,yaw\n";
+    for (size_t i = 0; i < d.ref_x.size(); ++i) {
+      ref << i << "," << d.ref_x[i] << "," << d.ref_y[i] << "," << d.ref_yaw[i] << "\n";
+    }
+  }
+  {
+    std::ofstream index(d.dir + "/index.csv", std::ios::app);
+    index.precision(17);
+    index << d.count << "," << clock_.now().nanoseconds() << "," << d.q.size() << "," << nnz
+          << "," << d.warm_start_update << "," << d.assemble_ms << "," << d.osqp_update_ms << ","
+          << solve_ms << "," << osqp_run_time_s * 1e3 << "," << iterations << "," << status << ","
+          << obj_val << "\n";
+  }
+  ++d.count;
+  if (d.count == d.max_count) {
+    RCLCPP_WARN(logger_, "QP dump finished: %zu problems written to %s", d.count, d.dir.c_str());
+  }
 }
 
 void EBPathSmoother::onParam(const std::vector<rclcpp::Parameter> & parameters)
@@ -347,6 +480,7 @@ void EBPathSmoother::updateConstraint(
 
   const auto & p = eb_param_;
 
+  time_keeper_ptr_->tic("assembleQP");
   std::vector<TrajectoryPoint> debug_fixed_traj_points;  // for debug
 
   const Eigen::MatrixXd A = Eigen::MatrixXd::Identity(p.num_points, p.num_points);
@@ -405,7 +539,11 @@ void EBPathSmoother::updateConstraint(
   // calculate q
   const Eigen::VectorXd raw_q_for_smooth = theta_P_mat * x_mat;
   const auto q = toStdVector(raw_q_for_smooth);
+  time_keeper_ptr_->toc("assembleQP", "          ");
+  const double assemble_ms = time_keeper_ptr_->getAccumulatedTime();
 
+  time_keeper_ptr_->tic("osqpUpdate");
+  const bool warm_start_update = p.enable_warm_start && osqp_solver_ptr_;
   if (p.enable_warm_start && osqp_solver_ptr_) {
     osqp_solver_ptr_->updateP(P);
     osqp_solver_ptr_->updateQ(q);
@@ -418,6 +556,25 @@ void EBPathSmoother::updateConstraint(
     osqp_solver_ptr_->updateEpsRel(p.qp_param.eps_rel);
     osqp_solver_ptr_->updateEpsAbs(p.qp_param.eps_abs);
     osqp_solver_ptr_->updateMaxIter(p.qp_param.max_iteration);
+  }
+  time_keeper_ptr_->toc("osqpUpdate", "          ");
+
+  if (qp_dump_) {
+    qp_dump_->P = P;
+    qp_dump_->q = q;
+    qp_dump_->l = lower_bound;
+    qp_dump_->u = upper_bound;
+    qp_dump_->ref_x.resize(p.num_points);
+    qp_dump_->ref_y.resize(p.num_points);
+    qp_dump_->ref_yaw.resize(p.num_points);
+    for (size_t i = 0; i < static_cast<size_t>(p.num_points); ++i) {
+      qp_dump_->ref_x[i] = traj_points.at(i).pose.position.x;
+      qp_dump_->ref_y[i] = traj_points.at(i).pose.position.y;
+      qp_dump_->ref_yaw[i] = tf2::getYaw(traj_points.at(i).pose.orientation);
+    }
+    qp_dump_->warm_start_update = warm_start_update;
+    qp_dump_->assemble_ms = assemble_ms;
+    qp_dump_->osqp_update_ms = time_keeper_ptr_->getAccumulatedTime();
   }
 
   // publish fixed trajectory
@@ -433,10 +590,19 @@ std::optional<std::vector<double>> EBPathSmoother::calcSmoothedTrajectory()
   time_keeper_ptr_->tic(__func__);
 
   // solve QP
+  time_keeper_ptr_->tic("osqpSolve");
   const auto result = osqp_solver_ptr_->optimize();
+  time_keeper_ptr_->toc("osqpSolve", "          ");
   const auto optimized_points = result.primal_solution;
 
   const auto status = result.solution_status;
+
+  if (qp_dump_) {  // dump also failed solves, they are the interesting ones
+    dumpQP(
+      optimized_points, time_keeper_ptr_->getAccumulatedTime(), status,
+      osqp_solver_ptr_->getTakenIter(), osqp_solver_ptr_->getRunTime(),
+      osqp_solver_ptr_->getObjVal());
+  }
 
   // check status
   if (status != 1) {

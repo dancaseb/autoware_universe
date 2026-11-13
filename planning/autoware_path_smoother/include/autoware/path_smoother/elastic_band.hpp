@@ -24,6 +24,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -125,6 +126,28 @@ private:
 
   std::unique_ptr<autoware::osqp_interface::OSQPInterface> osqp_solver_ptr_;
   std::shared_ptr<std::vector<TrajectoryPoint>> prev_eb_traj_points_ptr_{nullptr};
+
+  // QP dump for offline analysis. Enabled only when the environment variable
+  // EB_QP_DUMP_DIR is set (EB_QP_DUMP_MAX limits the number of dumped problems).
+  struct QPDump
+  {
+    std::string dir;
+    size_t max_count{1000};
+    size_t count{0};
+    // last assembled problem: min 1/2 x'Px + q'x  s.t.  l <= x <= u  (A = I)
+    Eigen::MatrixXd P;
+    std::vector<double> q, l, u;
+    std::vector<double> ref_x, ref_y, ref_yaw;  // reference points the offsets are applied to
+    bool warm_start_update{false};
+    double assemble_ms{0.0};
+    double osqp_update_ms{0.0};
+  };
+  std::optional<QPDump> qp_dump_;
+
+  void initQPDump();
+  void dumpQP(
+    const std::vector<double> & solution, const double solve_ms, const int status,
+    const int64_t iterations, const double osqp_run_time_s, const double obj_val);
 
   std::vector<TrajectoryPoint> insertFixedPoint(
     const std::vector<TrajectoryPoint> & traj_point) const;
